@@ -39,6 +39,7 @@ python main.py
 - `Source`：选择 Mock 或 UVC 摄像头。
 - `Scene`：选择 Mock 场景。
 - `Refresh`：刷新摄像头列表。
+- `Source` 默认显示可打开的 `UVC x`；若自动探测不到，会提供 `UVC 0..12 (manual)` 兜底项。
 - `Start/Stop`：开始或停止采集。
 - `Screenshot`：保存当前瞄具屏幕画面。
 

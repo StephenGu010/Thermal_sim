@@ -12,10 +12,9 @@ from __future__ import annotations
 
 import sys
 import time
-import subprocess
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -27,13 +26,16 @@ from . import thermal_processing
 SOURCE_UVC = "uvc"
 SOURCE_MOCK = "mock"
 
+ERR_OCCUPIED_CONFLICT = "occupied_conflict"
+ERR_FIRST_FRAME_TIMEOUT = "first_frame_timeout"
+ERR_FORMAT_UNSUPPORTED = "format_unsupported"
+ERR_STREAM_DISCONNECTED = "stream_disconnected"
+
 SCENE_BLOB = "blob_basic"
 SCENE_PERSON = "person_scene"
 SCENE_OBJECT = "object_scene"
 SCENE_MIXED = "mixed_scene"
 ALL_SCENES = (SCENE_BLOB, SCENE_PERSON, SCENE_OBJECT, SCENE_MIXED)
-REALTEK_VENDOR_DEC = 3034  # 0x0BDA
-_REALTEK_CAMERA_CACHE: Optional[bool] = None
 
 
 @dataclass
@@ -44,6 +46,16 @@ class CaptureConfig:
     height: int = 192
     target_fps: int = 25
     scene: str = SCENE_BLOB
+
+
+@dataclass
+class UVCProbeInfo:
+    index: int
+    backend: str
+    openable: bool
+    readable: bool
+    first_frame_ms: float
+    reason: str = ""
 
 
 class CaptureThread(QThread):
@@ -66,25 +78,76 @@ class CaptureThread(QThread):
     def _run_uvc(self, cfg: CaptureConfig) -> None:
         cap, backend_name = _open_uvc_capture(cfg.camera_index)
         if cap is None:
-            self.error.emit(f"无法打开摄像头 index={cfg.camera_index}")
+            self.error.emit(pack_capture_error(
+                ERR_OCCUPIED_CONFLICT,
+                f"无法打开摄像头 index={cfg.camera_index}",
+            ))
             return
 
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.height)
 
         y16_mode = _configure_y16(cap)
+        first_frame, first_frame_ms = _await_first_frame(cap, timeout_s=1.8, delay_s=0.06)
+        if first_frame is None:
+            self.status.emit(
+                f"UVC idx={cfg.camera_index} first-frame timeout ({first_frame_ms:.0f}ms), retrying reopen"
+            )
+            cap.release()
+            cap, backend_retry = _open_uvc_capture(cfg.camera_index)
+            if cap is None:
+                self.error.emit(pack_capture_error(
+                    ERR_OCCUPIED_CONFLICT,
+                    f"摄像头 index={cfg.camera_index} 可能被占用，请关闭 Photo Booth/相机软件后重试",
+                ))
+                return
+            backend_name = backend_retry
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.height)
+            y16_mode = _configure_y16(cap)
+            first_frame, first_frame_ms = _await_first_frame(cap, timeout_s=1.8, delay_s=0.06)
+            if first_frame is None:
+                cap.release()
+                self.error.emit(pack_capture_error(
+                    ERR_FIRST_FRAME_TIMEOUT,
+                    f"摄像头 index={cfg.camera_index} 首帧超时，请稍后重试",
+                ))
+                return
+
         if y16_mode:
-            self.status.emit(f"UVC opened idx={cfg.camera_index} backend={backend_name} mode=Y16(raw)")
+            self.status.emit(
+                f"UVC opened idx={cfg.camera_index} backend={backend_name} mode=Y16(raw) first={first_frame_ms:.0f}ms"
+            )
         else:
-            self.status.emit(f"UVC opened idx={cfg.camera_index} backend={backend_name} mode=8bit(fallback)")
+            self.status.emit(
+                f"UVC opened idx={cfg.camera_index} backend={backend_name} mode=8bit(fallback) first={first_frame_ms:.0f}ms"
+            )
 
         frame_id = 0
         last = time.perf_counter()
         try:
+            raw14 = _frame_to_raw14(first_frame, expect_y16=y16_mode)
+            if raw14 is None and y16_mode:
+                y16_mode = False
+                self.status.emit("Y16 stream not available, switched to 8bit fallback")
+                cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
+                raw14 = _frame_to_raw14(first_frame, expect_y16=False)
+            if raw14 is None:
+                self.error.emit(pack_capture_error(ERR_FORMAT_UNSUPPORTED, "无法解析摄像头帧格式"))
+                return
+
+            fps = self._tick_fps(last)
+            last = time.perf_counter()
+            self.frame_ready.emit(raw14, first_frame, frame_id, fps)
+            frame_id += 1
+
             while not self.isInterruptionRequested():
                 ok, frame = cap.read()
                 if not ok or frame is None:
-                    self.error.emit("摄像头读帧失败,可能已断开")
+                    self.error.emit(pack_capture_error(
+                        ERR_STREAM_DISCONNECTED,
+                        "摄像头读帧失败，可能已断开或被占用",
+                    ))
                     break
                 raw14 = _frame_to_raw14(frame, expect_y16=y16_mode)
                 if raw14 is None:
@@ -95,7 +158,7 @@ class CaptureThread(QThread):
                         cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
                         raw14 = _frame_to_raw14(frame, expect_y16=False)
                     if raw14 is None:
-                        self.error.emit("无法解析摄像头帧格式")
+                        self.error.emit(pack_capture_error(ERR_FORMAT_UNSUPPORTED, "无法解析摄像头帧格式"))
                         break
 
                 fps = self._tick_fps(last)
@@ -214,6 +277,34 @@ def _configure_y16(cap: cv2.VideoCapture) -> bool:
     return bool(ok_fourcc or ok_rgb)
 
 
+def pack_capture_error(code: str, message: str) -> str:
+    return f"{code}::{message}"
+
+
+def parse_capture_error(payload: str) -> tuple[str, str]:
+    code, sep, rest = payload.partition("::")
+    if not sep:
+        return "", payload
+    return code.strip(), rest.strip()
+
+
+def _await_first_frame(
+    cap: cv2.VideoCapture,
+    timeout_s: float = 1.8,
+    delay_s: float = 0.06,
+) -> tuple[Optional[np.ndarray], float]:
+    start = time.perf_counter()
+    deadline = start + max(0.1, timeout_s)
+    while time.perf_counter() < deadline:
+        ok, frame = cap.read()
+        if ok and frame is not None:
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            return frame, elapsed_ms
+        time.sleep(max(0.0, delay_s))
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+    return None, elapsed_ms
+
+
 def _frame_to_raw14(frame: np.ndarray, expect_y16: bool) -> Optional[np.ndarray]:
     if expect_y16:
         if frame.ndim == 2 and frame.dtype == np.uint16:
@@ -289,95 +380,44 @@ def _scene_object(xx: np.ndarray, yy: np.ndarray, w: int, h: int, t: float, cx_o
 
 
 def probe_uvc_indices(max_index: int = 12) -> list[int]:
-    """Probe camera indices quickly without hardcoding a platform backend."""
-    found: list[int] = []
+    """Return openable camera indices in natural order."""
+    return [item.index for item in probe_uvc_sources(max_index=max_index) if item.openable]
+
+
+def probe_uvc_sources(max_index: int = 12) -> list[UVCProbeInfo]:
+    """Probe indices and capture first-frame latency/readability hints."""
+    details: list[UVCProbeInfo] = []
     fail_streak = 0
     for i in range(max_index):
-        cap, _backend = _open_uvc_capture(i)
-        if cap is not None:
-            # Filter out "opens but no frame" devices (common with virtual/continuity cameras).
-            ok, frame = cap.read()
-            if ok and frame is not None:
-                found.append(i)
+        cap, backend = _open_uvc_capture(i)
+        if cap is None:
+            details.append(UVCProbeInfo(
+                index=i,
+                backend=backend,
+                openable=False,
+                readable=False,
+                first_frame_ms=-1.0,
+                reason="open_failed",
+            ))
+            fail_streak += 1
+        else:
+            frame, first_ms = _await_first_frame(cap, timeout_s=1.8, delay_s=0.06)
+            readable = frame is not None
+            reason = "" if readable else "first_frame_timeout"
+            details.append(UVCProbeInfo(
+                index=i,
+                backend=backend,
+                openable=True,
+                readable=readable,
+                first_frame_ms=first_ms,
+                reason=reason,
+            ))
             cap.release()
             fail_streak = 0
-        else:
-            fail_streak += 1
-        # Avoid long warning storms on platforms where valid camera indices are dense from 0..N.
-        if found and fail_streak >= 4:
+
+        # Avoid long warning storms on platforms where valid indices are dense from 0..N.
+        if any(item.openable for item in details) and fail_streak >= 4:
             break
-        if not found and i >= 6 and fail_streak >= 6:
+        if not any(item.openable for item in details) and i >= 6 and fail_streak >= 6:
             break
-    return found
-
-
-def realtek_camera_present() -> bool:
-    """Best-effort check whether a Realtek UVC camera is visible on this host."""
-    global _REALTEK_CAMERA_CACHE
-    if _REALTEK_CAMERA_CACHE is not None:
-        return _REALTEK_CAMERA_CACHE
-    if sys.platform != "darwin":
-        _REALTEK_CAMERA_CACHE = False
-        return _REALTEK_CAMERA_CACHE
-    try:
-        out = subprocess.run(
-            ["system_profiler", "SPCameraDataType"],
-            capture_output=True,
-            text=True,
-            timeout=4,
-            check=False,
-        )
-        txt = out.stdout or ""
-    except Exception:
-        txt = ""
-    lower = txt.lower()
-    _REALTEK_CAMERA_CACHE = (
-        f"vendorid_{REALTEK_VENDOR_DEC}" in lower
-        or "0xbda" in lower
-        or "realtek" in lower
-    )
-    return _REALTEK_CAMERA_CACHE
-
-
-def prioritize_uvc_indices(indices: List[int]) -> List[int]:
-    """Order candidate indices so likely thermal/Realtek camera appears first."""
-    if not indices:
-        return []
-
-    scored: List[Tuple[float, int]] = []
-    for idx in indices:
-        score = _thermal_likeness_score(idx)
-        scored.append((score, idx))
-    scored.sort(key=lambda it: it[0], reverse=True)
-    ordered = [idx for _score, idx in scored]
-    return ordered
-
-
-def _thermal_likeness_score(index: int) -> float:
-    """Heuristic score: grayscale-ish + low native resolution => more thermal-like."""
-    cap, _backend = _open_uvc_capture(index)
-    if cap is None:
-        return -1e9
-    try:
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            return -1e8
-        h, w = frame.shape[:2]
-        score = 0.0
-        # Thermal cameras are commonly grayscale-ish on UVC outputs.
-        if frame.ndim == 3 and frame.shape[2] >= 3:
-            b = frame[:, :, 0].astype(np.float32)
-            g = frame[:, :, 1].astype(np.float32)
-            r = frame[:, :, 2].astype(np.float32)
-            mean_ch_std = float(np.mean(np.std(np.stack([b, g, r], axis=2), axis=2)))
-            score += max(0.0, 10.0 - mean_ch_std)
-        # Lower default resolution tends to match thermal UVC paths.
-        if w <= 1280 and h <= 720:
-            score += 1.5
-        if w <= 640 and h <= 512:
-            score += 2.0
-        if w <= 320 and h <= 256:
-            score += 2.0
-        return score
-    finally:
-        cap.release()
+    return details

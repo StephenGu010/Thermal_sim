@@ -6,6 +6,7 @@ virtual physical buttons.
 """
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from typing import Optional
@@ -33,14 +34,17 @@ from core import target_classifier as tc
 from core import thermal_processing
 from core.camera_capture import (
     ALL_SCENES,
+    ERR_FIRST_FRAME_TIMEOUT,
+    ERR_FORMAT_UNSUPPORTED,
+    ERR_OCCUPIED_CONFLICT,
+    ERR_STREAM_DISCONNECTED,
     SCENE_PERSON,
     SOURCE_MOCK,
     SOURCE_UVC,
     CaptureConfig,
     CaptureThread,
-    prioritize_uvc_indices,
-    probe_uvc_indices,
-    realtek_camera_present,
+    parse_capture_error,
+    probe_uvc_sources,
 )
 from core.frame_recorder import Recorder, save_screenshot
 from ui.video_widget import ASPECT_NATIVE, VideoWidget
@@ -58,7 +62,9 @@ SCENE_NAMES = {
     "mixed_scene": "Mock Mixed",
 }
 PROBE_MAX_INDEX = 12
-MANUAL_FALLBACK_INDICES = tuple(range(8))
+SOURCE_COMBO_WIDTH = 240
+SCENE_COMBO_WIDTH = 170
+LAST_SOURCE_FILE = PROJECT_ROOT / "output" / "last_source.json"
 
 
 class MainWindow(QMainWindow):
@@ -81,6 +87,9 @@ class MainWindow(QMainWindow):
             tuple[np.ndarray, np.ndarray, np.ndarray, list, tuple[int, int, int]]
         ] = None
         self._button_down_at: dict[str, float] = {}
+        self._active_source_data = None
+        self._saved_source_this_run = False
+        self._source_probe_cache = []
 
         self._build_ui()
         self.setStatusBar(QStatusBar())
@@ -145,8 +154,10 @@ class MainWindow(QMainWindow):
         bar.setSpacing(8)
 
         self.cmb_source = QComboBox()
+        self.cmb_source.setFixedWidth(SOURCE_COMBO_WIDTH)
         self._populate_sources()
         self.cmb_scene = QComboBox()
+        self.cmb_scene.setFixedWidth(SCENE_COMBO_WIDTH)
         for scene in ALL_SCENES:
             self.cmb_scene.addItem(SCENE_NAMES.get(scene, scene), scene)
         self.cmb_scene.setCurrentIndex(list(ALL_SCENES).index(SCENE_PERSON))
@@ -198,21 +209,26 @@ class MainWindow(QMainWindow):
     def _populate_sources(self) -> None:
         self.cmb_source.clear()
         self.cmb_source.addItem("Mock", SOURCE_MOCK)
-        indices = probe_uvc_indices(max_index=PROBE_MAX_INDEX)
-        is_realtek = realtek_camera_present()
-        ordered = prioritize_uvc_indices(indices) if indices else []
-        for pos, idx in enumerate(ordered):
-            if is_realtek and pos == 0:
-                label = f"UVC {idx} (Realtek preferred)"
-            else:
-                label = f"UVC {idx}"
-            self.cmb_source.addItem(label, (SOURCE_UVC, idx))
+        details = probe_uvc_sources(max_index=PROBE_MAX_INDEX)
+        self._source_probe_cache = details
+        indices = [item.index for item in details if item.openable]
+        for idx in indices:
+            self.cmb_source.addItem(f"UVC {idx}", (SOURCE_UVC, idx))
         if not indices:
-            # Keep manual options so users can try indices even when auto-probe is blocked.
-            for idx in MANUAL_FALLBACK_INDICES:
+            for idx in range(PROBE_MAX_INDEX + 1):
                 self.cmb_source.addItem(f"UVC {idx} (manual)", (SOURCE_UVC, idx))
-        elif is_realtek and self.cmb_source.count() > 1:
-            # Default-select the likely Realtek camera entry.
+
+        # If we have a remembered source and it still exists, restore it.
+        remembered = self._load_last_uvc_index()
+        restored = False
+        if remembered is not None:
+            for i in range(self.cmb_source.count()):
+                if self.cmb_source.itemData(i) == (SOURCE_UVC, remembered):
+                    self.cmb_source.setCurrentIndex(i)
+                    restored = True
+                    break
+        if not restored and self.cmb_source.count() > 1:
+            # Fallback to the first UVC source (auto-detected or manual).
             self.cmb_source.setCurrentIndex(1)
 
     def _refresh_sources(self) -> None:
@@ -222,19 +238,33 @@ class MainWindow(QMainWindow):
             if self.cmb_source.itemData(i) == current:
                 self.cmb_source.setCurrentIndex(i)
                 break
-        n_cams = max(0, self.cmb_source.count() - 1)
-        self._notify(f"Camera list refreshed: {n_cams} UVC options")
+        openable = [item for item in self._source_probe_cache if item.openable]
+        readable = [item for item in self._source_probe_cache if item.readable]
+        if openable:
+            timing = ", ".join(
+                f"{item.index}:{item.first_frame_ms:.0f}ms{'*' if item.readable else ''}"
+                for item in openable
+            )
+            self._notify(f"Camera list refreshed: openable={len(openable)} readable={len(readable)} [{timing}]")
+        else:
+            self._notify("Camera list refreshed: no openable UVC, manual indices enabled (0-12)")
 
     def _start_capture(self) -> None:
         if self._capture is not None:
             return
         source = self.cmb_source.currentData()
+        if source is None:
+            self._notify("Please select a valid source")
+            return
         scene = self.cmb_scene.currentData()
         if source == SOURCE_MOCK:
             cfg = CaptureConfig(source_kind=SOURCE_MOCK, width=256, height=192, scene=scene)
+        elif self._is_uvc_item(source):
+            _kind, idx = source
+            cfg = CaptureConfig(source_kind=SOURCE_UVC, camera_index=int(idx), width=256, height=192, scene=scene)
         else:
-            kind, idx = source
-            cfg = CaptureConfig(source_kind=kind, camera_index=idx, width=256, height=192, scene=scene)
+            self._notify("Unsupported source entry")
+            return
 
         self._capture = CaptureThread(cfg)
         self._capture.frame_ready.connect(self._on_frame)
@@ -242,6 +272,8 @@ class MainWindow(QMainWindow):
         self._capture.error.connect(self._on_capture_error)
         self._capture.finished.connect(self._on_capture_finished)
         self._capture.start()
+        self._active_source_data = source
+        self._saved_source_this_run = False
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self._notify(f"Capture started: {self.cmb_source.currentText()}")
@@ -254,6 +286,8 @@ class MainWindow(QMainWindow):
 
     def _on_capture_finished(self) -> None:
         self._capture = None
+        self._active_source_data = None
+        self._saved_source_this_run = False
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         if self._recorder.is_recording:
@@ -261,8 +295,20 @@ class MainWindow(QMainWindow):
         self._notify("Capture stopped")
 
     def _on_capture_error(self, msg: str) -> None:
-        self._notify(f"Error: {msg}")
-        QMessageBox.warning(self, "Capture error", msg)
+        code, detail = parse_capture_error(msg)
+        if code == ERR_OCCUPIED_CONFLICT:
+            user_msg = f"{detail}\n\n可能原因：占用冲突。\n建议：关闭 Photo Booth/微信/浏览器相机页后重试。"
+        elif code == ERR_FIRST_FRAME_TIMEOUT:
+            user_msg = f"{detail}\n\n可能原因：设备初始化较慢或短时抖动。\n建议：等待 2-3 秒后再 Start。"
+        elif code == ERR_FORMAT_UNSUPPORTED:
+            user_msg = f"{detail}\n\n可能原因：当前输出格式不受支持。\n建议：切换其他 UVC 索引或关闭 Y16-only 设备占用。"
+        elif code == ERR_STREAM_DISCONNECTED:
+            user_msg = f"{detail}\n\n可能原因：线缆/供电/占用变化。\n建议：重新插拔并 Refresh 后重试。"
+        else:
+            user_msg = detail or msg
+        code_tag = f"[{code}] " if code else ""
+        self._notify(f"Error: {code_tag}{detail or msg}")
+        QMessageBox.warning(self, "Capture error", user_msg)
 
     # ------------------------------------------------------------------
     # Scope controls
@@ -343,6 +389,11 @@ class MainWindow(QMainWindow):
             self.video.set_frame(self._last_scope)
             return
 
+        if not self._saved_source_this_run and self._is_uvc_item(self._active_source_data):
+            _kind, idx = self._active_source_data
+            self._save_last_uvc_index(int(idx))
+            self._saved_source_this_run = True
+
         raw14_u16 = thermal_processing.to_raw14(raw14)
         self._last_raw = raw14_u16.copy()
         self._process_raw_to_components(raw14_u16)
@@ -418,6 +469,38 @@ class MainWindow(QMainWindow):
 
     def _notify(self, msg: str) -> None:
         self.log_line.emit(msg)
+
+    @staticmethod
+    def _is_uvc_item(data) -> bool:
+        return isinstance(data, tuple) and len(data) == 2 and data[0] == SOURCE_UVC
+
+    def _load_last_uvc_index(self) -> Optional[int]:
+        try:
+            if not LAST_SOURCE_FILE.exists():
+                return None
+            payload = json.loads(LAST_SOURCE_FILE.read_text(encoding="utf-8"))
+            if payload.get("source_kind") == SOURCE_UVC:
+                idx = payload.get("camera_index")
+                if isinstance(idx, int):
+                    return idx
+        except Exception:
+            return None
+        return None
+
+    def _save_last_uvc_index(self, index: int) -> None:
+        try:
+            LAST_SOURCE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            payload = {}
+            if LAST_SOURCE_FILE.exists():
+                payload = json.loads(LAST_SOURCE_FILE.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    payload = {}
+            payload["source_kind"] = SOURCE_UVC
+            payload["camera_index"] = int(index)
+            LAST_SOURCE_FILE.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
+        except Exception:
+            # Persistence failure should never block capture.
+            pass
 
     def closeEvent(self, event) -> None:
         if self._capture is not None:
