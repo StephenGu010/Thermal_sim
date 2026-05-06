@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+output/screenshots/*.png
+output/recordings/*.mp4
+!output/screenshots/.gitkeep
+!output/recordings/.gitkeep
+.idea/
+.vscode/
