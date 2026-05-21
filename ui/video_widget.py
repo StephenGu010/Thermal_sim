@@ -23,10 +23,13 @@ class VideoWidget(QWidget):
         pal.setColor(self.backgroundRole(), QColor(0, 0, 0))
         self.setPalette(pal)
         self._bgr: Optional[np.ndarray] = None
+        self._qimg: Optional[QImage] = None
         self._aspect = ASPECT_NATIVE
 
     def set_frame(self, bgr: np.ndarray) -> None:
-        self._bgr = self._apply_aspect(bgr)
+        self._bgr = np.ascontiguousarray(self._apply_aspect(bgr))
+        h, w = self._bgr.shape[:2]
+        self._qimg = QImage(self._bgr.data, w, h, self._bgr.strides[0], QImage.Format_BGR888)
         self.update()
 
     def set_aspect(self, mode: str) -> None:
@@ -36,13 +39,12 @@ class VideoWidget(QWidget):
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor(0, 0, 0))
-        if self._bgr is None:
+        if self._bgr is None or self._qimg is None:
             painter.setPen(QColor(170, 190, 190))
             painter.drawText(self.rect(), Qt.AlignCenter, "(no scope frame)\nPress Start")
             return
         h, w = self._bgr.shape[:2]
-        qimg = QImage(self._bgr.data, w, h, w * 3, QImage.Format_BGR888).copy()
-        painter.drawImage(self._fit_rect(w, h), qimg)
+        painter.drawImage(self._fit_rect(w, h), self._qimg)
 
     def _fit_rect(self, src_w: int, src_h: int) -> QRect:
         avail = self.rect()
