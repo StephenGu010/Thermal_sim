@@ -61,9 +61,14 @@ SCENE_NAMES = {
     "object_scene": "Mock Object",
     "mixed_scene": "Mock Mixed",
 }
+PROFILE_NAMES = {
+    outline_processing.PROFILE_THERMAL: "Thermal Tiny1-C",
+    outline_processing.PROFILE_VISIBLE: "Visible Demo",
+}
 PROBE_MAX_INDEX = 12
 SOURCE_COMBO_WIDTH = 240
 SCENE_COMBO_WIDTH = 170
+PROFILE_COMBO_WIDTH = 180
 LAST_SOURCE_FILE = PROJECT_ROOT / "output" / "last_source.json"
 
 
@@ -79,12 +84,14 @@ class MainWindow(QMainWindow):
         self._capture: Optional[CaptureThread] = None
         self._recorder = Recorder()
         self._state = scope_renderer.ScopeRenderState()
+        self._outline_processor = outline_processing.OutlineProcessor()
         self._detect_cfg = hotspot_detector.DetectConfig(percentile=89.0, min_area=14)
         self._classify_cfg = tc.ClassifyConfig()
         self._last_scope: Optional[np.ndarray] = None
         self._last_raw: Optional[np.ndarray] = None
+        self._last_visible_frame: Optional[np.ndarray] = None
         self._last_components: Optional[
-            tuple[np.ndarray, np.ndarray, np.ndarray, list, tuple[int, int, int]]
+            tuple[np.ndarray, np.ndarray, np.ndarray, list, Optional[tuple[int, int, int]]]
         ] = None
         self._button_down_at: dict[str, float] = {}
         self._active_source_data = None
@@ -161,6 +168,12 @@ class MainWindow(QMainWindow):
         for scene in ALL_SCENES:
             self.cmb_scene.addItem(SCENE_NAMES.get(scene, scene), scene)
         self.cmb_scene.setCurrentIndex(list(ALL_SCENES).index(SCENE_PERSON))
+        self.cmb_profile = QComboBox()
+        self.cmb_profile.setFixedWidth(PROFILE_COMBO_WIDTH)
+        for profile, label in PROFILE_NAMES.items():
+            self.cmb_profile.addItem(label, profile)
+        self.cmb_profile.setCurrentIndex(0)
+        self.cmb_profile.currentIndexChanged.connect(self._on_profile_changed)
 
         self.btn_refresh = QToolButton()
         self.btn_refresh.setText("Refresh")
@@ -180,6 +193,7 @@ class MainWindow(QMainWindow):
         for label, widget in (
             ("Source", self.cmb_source),
             ("Scene", self.cmb_scene),
+            ("Profile", self.cmb_profile),
         ):
             lab = QLabel(label)
             lab.setStyleSheet("color:#9aa;")
@@ -271,12 +285,13 @@ class MainWindow(QMainWindow):
         self._capture.status.connect(self._notify)
         self._capture.error.connect(self._on_capture_error)
         self._capture.finished.connect(self._on_capture_finished)
+        self._outline_processor.reset()
         self._capture.start()
         self._active_source_data = source
         self._saved_source_this_run = False
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self._notify(f"Capture started: {self.cmb_source.currentText()}")
+        self._notify(f"Capture started: {self.cmb_source.currentText()} / {self._profile_text()}")
 
     def _stop_capture(self) -> None:
         if self._capture is None:
@@ -288,6 +303,7 @@ class MainWindow(QMainWindow):
         self._capture = None
         self._active_source_data = None
         self._saved_source_this_run = False
+        self._outline_processor.reset()
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         if self._recorder.is_recording:
@@ -364,6 +380,16 @@ class MainWindow(QMainWindow):
         zooms = [1, 2, 4, 8]
         self._state.zoom = zooms[(zooms.index(self._state.zoom) + 1) % len(zooms)]
 
+    def _on_profile_changed(self) -> None:
+        profile = self._current_profile()
+        self._state.processing_profile = profile
+        self._outline_processor.reset()
+        if profile == outline_processing.PROFILE_VISIBLE:
+            self._notify("Profile: Visible Demo (ordinary-camera edge demo, not thermal)")
+        else:
+            self._notify("Profile: Thermal Tiny1-C (raw/Y16 preferred)")
+        self._rerender_last(force_reenhance=True)
+
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.isAutoRepeat():
             return
@@ -384,7 +410,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Frame processing
     # ------------------------------------------------------------------
-    def _on_frame(self, raw14: np.ndarray, _bgr_or_none, frame_id: int, fps: float) -> None:
+    def _on_frame(self, raw14: np.ndarray, bgr_or_none, frame_id: int, fps: float) -> None:
         if self._state.frozen and self._last_scope is not None:
             self.video.set_frame(self._last_scope)
             return
@@ -396,28 +422,50 @@ class MainWindow(QMainWindow):
 
         raw14_u16 = thermal_processing.to_raw14(raw14)
         self._last_raw = raw14_u16.copy()
-        self._process_raw_to_components(raw14_u16)
+        self._last_visible_frame = bgr_or_none.copy() if isinstance(bgr_or_none, np.ndarray) else None
+        self._process_raw_to_components(raw14_u16, self._last_visible_frame, update_temporal=True)
 
         self._state.frame_id = frame_id
         self._state.fps = fps
         self._rerender_last()
 
-    def _process_raw_to_components(self, raw14_u16: np.ndarray) -> None:
+    def _process_raw_to_components(
+        self,
+        raw14_u16: np.ndarray,
+        visible_frame: Optional[np.ndarray] = None,
+        update_temporal: bool = True,
+    ) -> None:
+        profile = self._current_profile()
+        self._state.processing_profile = profile
         enhance_cfg = scope_enhancement.ScopeEnhanceConfig(level=self._state.enhancement_level)
         enhanced = scope_enhancement.enhance_scope_whitehot(raw14_u16, enhance_cfg)
-        outline_cfg = outline_processing.OutlineConfig(level=self._state.enhancement_level)
-        outline = outline_processing.render_outline(raw14_u16, outline_cfg)
+        outline_cfg = outline_processing.OutlineConfig(
+            level=self._state.enhancement_level,
+            profile=profile,
+        )
+        outline = self._outline_processor.render(
+            raw14_u16,
+            outline_cfg,
+            visible_frame=visible_frame,
+            update_temporal=update_temporal,
+        )
 
-        hx, hy, hv = hotspot_detector.find_hotspot(enhanced)
-        mask, _regions = hotspot_detector.find_candidates(enhanced, self._detect_cfg)
-        contours = contour_overlay.extract_contours(mask, min_area=self._detect_cfg.min_area)
-        classifications = tc.classify_all(contours, enhanced, mask, self._classify_cfg)
+        if profile == outline_processing.PROFILE_VISIBLE:
+            mask = np.zeros_like(enhanced, dtype=np.uint8)
+            classifications = []
+            hotspot = None
+        else:
+            hx, hy, hv = hotspot_detector.find_hotspot(enhanced)
+            mask, _regions = hotspot_detector.find_candidates(enhanced, self._detect_cfg)
+            contours = contour_overlay.extract_contours(mask, min_area=self._detect_cfg.min_area)
+            classifications = tc.classify_all(contours, enhanced, mask, self._classify_cfg)
+            hotspot = (hx, hy, hv)
 
-        self._last_components = (enhanced, outline, mask, classifications, (hx, hy, hv))
+        self._last_components = (enhanced, outline, mask, classifications, hotspot)
 
     def _rerender_last(self, force_reenhance: bool = False) -> None:
         if force_reenhance and self._last_raw is not None:
-            self._process_raw_to_components(self._last_raw)
+            self._process_raw_to_components(self._last_raw, self._last_visible_frame, update_temporal=False)
         if self._last_components is None:
             self._update_state_label()
             return
@@ -430,6 +478,8 @@ class MainWindow(QMainWindow):
         self._update_state_label()
 
     def _update_state_label(self) -> None:
+        self._state.processing_profile = self._current_profile()
+        profile = "VISIBLE DEMO" if self._state.processing_profile == outline_processing.PROFILE_VISIBLE else "THERMAL"
         mode = "OUTLINE" if self._state.outline_enabled else (
             "BHOT" if self._state.palette == scope_renderer.PALETTE_BLACKHOT else "WHOT"
         )
@@ -437,7 +487,7 @@ class MainWindow(QMainWindow):
         hold = " HOLD" if self._state.frozen else ""
         outline = "" if self._state.outline_enabled else " NO-OUT"
         self.lbl_state.setText(
-            f"{mode}  ENH {self._state.enhancement_level}  ZOOM {self._state.zoom}x{outline}{hold}{menu}"
+            f"{profile}  {mode}  ENH {self._state.enhancement_level}  ZOOM {self._state.zoom}x{outline}{hold}{menu}"
         )
 
     # ------------------------------------------------------------------
@@ -473,6 +523,17 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _is_uvc_item(data) -> bool:
         return isinstance(data, tuple) and len(data) == 2 and data[0] == SOURCE_UVC
+
+    def _current_profile(self) -> str:
+        if not hasattr(self, "cmb_profile"):
+            return outline_processing.PROFILE_THERMAL
+        profile = self.cmb_profile.currentData()
+        if profile in outline_processing.ALL_PROFILES:
+            return profile
+        return outline_processing.PROFILE_THERMAL
+
+    def _profile_text(self) -> str:
+        return PROFILE_NAMES.get(self._current_profile(), "Thermal Tiny1-C")
 
     def _load_last_uvc_index(self) -> Optional[int]:
         try:

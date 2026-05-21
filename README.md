@@ -6,10 +6,11 @@
 
 ## 功能定位
 
-- 输入：Tiny1-C USB 摄像头或 Mock 热图场景。
+- 输入：Tiny1-C USB 摄像头、Mock 热图场景，或普通可见光摄像头演示。
 - 内部数据：统一 14-bit `raw14`（`uint16`, 0..16383）。
 - 显示：横向热成像瞄具屏幕，白热/黑热增强和纯 Outline 模式。
 - 增强：AGC/DDE-like 热图增强，突出目标细节和弱纹理。
+- 双 Profile：`Thermal Tiny1-C` 使用热图 raw/Y16 主链路；`Visible Demo` 仅做普通摄像头黑底亮边演示。
 - 叠加：中心十字分划、倍率、增强等级、菜单、热点标记。
 - 候选目标：基于 candidate mask、轮廓和几何规则进行人物候选高亮。
 - 操作：两枚虚拟物理按键模拟真实瞄具交互。
@@ -18,6 +19,7 @@
 ## 重要说明
 
 - 白热/黑热与 Outline 效果均为 PC 端软件仿真，不代表厂商专有算法细节公开。
+- 可见光摄像头没有温差信息，`Visible Demo` 不能代表真实热成像增强效果，只用于调试和演示轮廓风格。
 - 人物候选为规则辅助分类，不是训练完成的 AI 人体识别。
 - 不显示真实摄氏温度；界面使用的是相对热强度和显示增强结果。
 - 当前工具用于模拟后续 ESP32-S3 显示层效果，可与 FPGA 输出 `thumb + candidate mask + metadata` 的毕业设计方案对应。
@@ -30,6 +32,14 @@ pip install -r requirements.txt
 python main.py
 ```
 
+macOS 本地虚拟环境示例：
+
+```bash
+cd "/Users/stephengu/Desktop/毕业设计/Thermal_sim"
+source .venv/bin/activate
+python main.py
+```
+
 默认使用 Mock Person 场景，方便直接验证人物候选轮廓高亮。
 
 ## 界面操作
@@ -38,6 +48,9 @@ python main.py
 
 - `Source`：选择 Mock 或 UVC 摄像头。
 - `Scene`：选择 Mock 场景。
+- `Profile`：
+  - `Thermal Tiny1-C`：Tiny1-C/Mock 热图主模式，优先使用 Y16/raw14 数据。
+  - `Visible Demo`：普通可见光摄像头轮廓演示，不做热目标分类。
 - `Refresh`：刷新摄像头列表。
 - `Source` 默认显示可打开的 `UVC x`；若自动探测不到，会提供 `UVC 0..12 (manual)` 兜底项。
 - `Start/Stop`：开始或停止采集。
@@ -69,7 +82,7 @@ python main.py
 
 ## 技术路线
 
-显示增强分为两条渲染链路：
+显示增强分为三条关键链路：
 
 ```text
 USB/Mock raw14
@@ -79,14 +92,25 @@ USB/Mock raw14
    → Gaussian base/detail decomposition
    → detail gain
    → white-hot/black-hot mapping
-→ OUTLINE链路:
-   denoise(5x5)
+→ Thermal Tiny1-C OUTLINE链路:
+   bad-pixel suppression
+   → temporal EMA
+   → light spatial denoise
+   → thermal target gate
    → Sobel5x5 + Scharr 混合梯度
    → gradient magnitude + direction
    → NMS(1像素压缩)
    → hysteresis edge linking
+   → edge density cap
    → 1-2像素智能补边
-   → low-frequency=0, high-frequency->255
+   → strength-weighted outline
+→ Visible Demo OUTLINE链路:
+   visible grayscale
+   → bilateral/Gaussian denoise
+   → mild contrast stretch
+   → Sobel/Scharr + Canny-like linking
+   → small-component cleanup
+   → edge density cap
 → candidate mask
 → contour extraction
 → rule-based person/object candidate classification
@@ -96,6 +120,7 @@ USB/Mock raw14
 其中：
 
 - `OUTLINE=ON` 时底图改为纯边缘图，不叠加人物/物体分类描边。
+- `Visible Demo` 下不运行热目标分类和热点标记，HUD 会显示 `VISIBLE DEMO`。
 - 低频分量在 outline 输出中直接置零，仅保留高频边缘。
 - 文档 `docs/holosun_outline_reverse_engineering.md` 记录了参数、依据和偏差说明。
 
@@ -109,7 +134,7 @@ thermal_sim_v3/
 ├── core/
 │   ├── camera_capture.py       UVC/Mock 采集
 │   ├── scope_enhancement.py    AGC/DDE-like 热图增强
-│   ├── outline_processing.py   Outline 纯轮廓处理链路
+│   ├── outline_processing.py   Thermal/Visible 双 Profile Outline 链路
 │   ├── scope_renderer.py       瞄具屏幕 HUD 渲染
 │   ├── hotspot_detector.py     热点和 candidate mask
 │   ├── contour_overlay.py      外轮廓和几何特征
@@ -135,6 +160,7 @@ python -m compileall -q main.py core ui
 1. `python main.py` 能启动。
 2. Mock Person 场景显示横向瞄具画面。
 3. 中央有简洁十字分划。
-4. `OUTLINE=ON` 时画面低频背景接近全黑，仅保留高亮边缘。
+4. `OUTLINE=ON` 时画面低频背景接近全黑，主轮廓连续，杂边不过量。
 5. 两个虚拟按键能切换菜单、倍率、增强等级和截图。
 6. 截图保存的是最终瞄具屏幕画面。
+7. 切换到 `Visible Demo` 时，HUD/状态栏明确显示可见光演示模式。

@@ -26,6 +26,7 @@ class ScopeRenderState:
     frozen: bool = False
     frame_id: int = 0
     fps: float = 0.0
+    processing_profile: str = "thermal"
 
 
 SCREEN_W = 960
@@ -219,9 +220,15 @@ def _draw_hud(img: np.ndarray, state: ScopeRenderState) -> None:
 
     cv2.putText(img, "ZOOM", (SCREEN_W - 86, 185), font, 0.55, HUD, 1, cv2.LINE_AA)
     cv2.putText(img, f"{state.zoom}x", (SCREEN_W - 78, 230), font, 0.72, HUD, 2, cv2.LINE_AA)
-    mode = "OUT" if state.outline_enabled else ("BHOT" if state.palette == PALETTE_BLACKHOT else "WHOT")
+    visible = state.processing_profile == "visible"
+    if visible:
+        mode = "VOUT" if state.outline_enabled else "VIS"
+    else:
+        mode = "OUT" if state.outline_enabled else ("BHOT" if state.palette == PALETTE_BLACKHOT else "WHOT")
     freeze = " HOLD" if state.frozen else ""
     cv2.putText(img, f"{mode}{freeze}", (SCREEN_W - 132, SCREEN_H - 24), font, 0.48, HUD_DIM, 1, cv2.LINE_AA)
+    profile = "VISIBLE DEMO" if visible else "THERMAL RAW"
+    cv2.putText(img, profile, (28, SCREEN_H - 24), font, 0.46, HUD_DIM, 1, cv2.LINE_AA)
 
 
 def _draw_menu(img: np.ndarray, state: ScopeRenderState) -> None:
