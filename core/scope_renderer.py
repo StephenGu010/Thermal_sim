@@ -38,6 +38,40 @@ OBJECT_COLOR = (150, 170, 170)
 HOTSPOT_COLOR = (190, 255, 255)
 
 
+_U8_VALUES = np.arange(256, dtype=np.float32)
+
+
+def _make_lut(multiplier: float) -> np.ndarray:
+    return np.clip(_U8_VALUES * multiplier, 0, 255).astype(np.uint8)
+
+
+_WHITEHOT_LUTS = (
+    _make_lut(1.08),
+    _make_lut(1.02),
+    _make_lut(0.90),
+)
+_BLACKHOT_LUTS = (
+    _make_lut(0.92),
+    _make_lut(0.96),
+    _make_lut(1.00),
+)
+_OUTLINE_LUTS = (
+    _make_lut(0.98),
+    _make_lut(1.00),
+    _make_lut(0.86),
+)
+
+
+def _make_vignette(strength: float, floor: float) -> np.ndarray:
+    yy, xx = np.mgrid[0:SCREEN_H, 0:SCREEN_W].astype(np.float32)
+    rr = ((xx - SCREEN_W / 2) / (SCREEN_W / 2)) ** 2 + ((yy - SCREEN_H / 2) / (SCREEN_H / 2)) ** 2
+    return np.clip(1.0 - strength * rr, floor, 1.0).astype(np.float32)
+
+
+_THERMAL_VIGNETTE = _make_vignette(0.38, 0.58)
+_OUTLINE_VIGNETTE = _make_vignette(0.32, 0.62)
+
+
 def render_scope_frame(
     enhanced_gray: np.ndarray,
     outline_gray: np.ndarray,
@@ -89,33 +123,15 @@ def _scale_from_crop(crop: tuple[int, int, int, int]) -> tuple[float, float]:
 
 
 def _whitehot_to_bgr(gray: np.ndarray, palette: str) -> np.ndarray:
-    g = gray.astype(np.float32)
-    if palette == PALETTE_BLACKHOT:
-        b = np.clip(g * 0.92, 0, 255)
-        gr = np.clip(g * 0.96, 0, 255)
-        r = np.clip(g, 0, 255)
-    else:
-        b = np.clip(g * 1.08, 0, 255)
-        gr = np.clip(g * 1.02, 0, 255)
-        r = np.clip(g * 0.90, 0, 255)
-    out = np.dstack([b, gr, r]).astype(np.uint8)
+    luts = _BLACKHOT_LUTS if palette == PALETTE_BLACKHOT else _WHITEHOT_LUTS
+    out = cv2.merge([cv2.LUT(gray, lut) for lut in luts])
     # Dark vignette helps the view read like an optic rather than a flat image.
-    yy, xx = np.mgrid[0:SCREEN_H, 0:SCREEN_W].astype(np.float32)
-    rr = ((xx - SCREEN_W / 2) / (SCREEN_W / 2)) ** 2 + ((yy - SCREEN_H / 2) / (SCREEN_H / 2)) ** 2
-    vignette = np.clip(1.0 - 0.38 * rr, 0.58, 1.0)
-    return (out.astype(np.float32) * vignette[..., None]).astype(np.uint8)
+    return (out.astype(np.float32) * _THERMAL_VIGNETTE[..., None]).astype(np.uint8)
 
 
 def _outline_to_bgr(gray: np.ndarray) -> np.ndarray:
-    g = gray.astype(np.float32)
-    b = np.clip(g * 0.98, 0, 255)
-    gr = np.clip(g * 1.00, 0, 255)
-    r = np.clip(g * 0.86, 0, 255)
-    out = np.dstack([b, gr, r]).astype(np.uint8)
-    yy, xx = np.mgrid[0:SCREEN_H, 0:SCREEN_W].astype(np.float32)
-    rr = ((xx - SCREEN_W / 2) / (SCREEN_W / 2)) ** 2 + ((yy - SCREEN_H / 2) / (SCREEN_H / 2)) ** 2
-    vignette = np.clip(1.0 - 0.32 * rr, 0.62, 1.0)
-    return (out.astype(np.float32) * vignette[..., None]).astype(np.uint8)
+    out = cv2.merge([cv2.LUT(gray, lut) for lut in _OUTLINE_LUTS])
+    return (out.astype(np.float32) * _OUTLINE_VIGNETTE[..., None]).astype(np.uint8)
 
 
 def _map_pt(x: float, y: float, crop: tuple[int, int, int, int], sx: float, sy: float) -> tuple[int, int]:

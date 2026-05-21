@@ -84,8 +84,7 @@ class CaptureThread(QThread):
             ))
             return
 
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.height)
+        _configure_capture_timing(cap, cfg)
 
         y16_mode = _configure_y16(cap)
         first_frame, first_frame_ms = _await_first_frame(cap, timeout_s=1.8, delay_s=0.06)
@@ -102,8 +101,7 @@ class CaptureThread(QThread):
                 ))
                 return
             backend_name = backend_retry
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.height)
+            _configure_capture_timing(cap, cfg)
             y16_mode = _configure_y16(cap)
             first_frame, first_frame_ms = _await_first_frame(cap, timeout_s=1.8, delay_s=0.06)
             if first_frame is None:
@@ -275,6 +273,18 @@ def _configure_y16(cap: cv2.VideoCapture) -> bool:
     except Exception:
         ok_rgb = False
     return bool(ok_fourcc or ok_rgb)
+
+
+def _configure_capture_timing(cap: cv2.VideoCapture, cfg: CaptureConfig) -> None:
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.height)
+    cap.set(cv2.CAP_PROP_FPS, max(1, cfg.target_fps))
+    # On Windows, the backend can otherwise queue old frames faster than Qt can
+    # display them, which feels like UI jank even when processing is acceptable.
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
 
 
 def pack_capture_error(code: str, message: str) -> str:
