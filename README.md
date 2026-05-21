@@ -51,6 +51,12 @@ python main.py
 - `Profile`：
   - `Thermal Tiny1-C`：Tiny1-C/Mock 热图主模式，优先使用 Y16/raw14 数据。
   - `Visible Demo`：普通可见光摄像头轮廓演示，不做热目标分类。
+- `Resolution`：
+  - `Native 256x192`：按 Tiny1-C 原生热像尺寸处理。
+  - `HD 640x480` / `720p 1280x720`：UVC/可见光优先请求更高采集分辨率。
+  - `Tiny x2 Detail`：采集仍为 256×192，但 Outline 内部以约 2 倍尺寸做边缘处理。
+- `Detail`：`Clean/Balanced/Fine/Ultra`，控制边缘密度、阈值、补线和内部处理倍率。
+- `Smooth`：`Off/Low/Mid/High`，控制时域 EMA、低通/双边滤波和边缘 glow。
 - `Refresh`：刷新摄像头列表。
 - `Source` 默认显示可打开的 `UVC x`；若自动探测不到，会提供 `UVC 0..12 (manual)` 兜底项。
 - `Start/Stop`：开始或停止采集。
@@ -95,6 +101,7 @@ USB/Mock raw14
 → Thermal Tiny1-C OUTLINE链路:
    bad-pixel suppression
    → temporal EMA
+   → optional internal upsample (Tiny x2 Detail / Detail mode)
    → light spatial denoise
    → thermal target gate
    → Sobel5x5 + Scharr 混合梯度
@@ -103,9 +110,10 @@ USB/Mock raw14
    → hysteresis edge linking
    → edge density cap
    → 1-2像素智能补边
-   → strength-weighted outline
+   → hard-edge outline mapping
 → Visible Demo OUTLINE链路:
    visible grayscale
+   → optional high-resolution capture / internal upsample
    → bilateral/Gaussian denoise
    → mild contrast stretch
    → Sobel/Scharr + Canny-like linking
@@ -121,6 +129,7 @@ USB/Mock raw14
 
 - `OUTLINE=ON` 时底图改为纯边缘图，不叠加人物/物体分类描边。
 - `Visible Demo` 下不运行热目标分类和热点标记，HUD 会显示 `VISIBLE DEMO`。
+- `Tiny x2 Detail` 是算法内部上采样增强，不代表 Tiny1-C 传感器物理分辨率提升。
 - 低频分量在 outline 输出中直接置零，仅保留高频边缘。
 - 文档 `docs/holosun_outline_reverse_engineering.md` 记录了参数、依据和偏差说明。
 
@@ -164,3 +173,4 @@ python -m compileall -q main.py core ui
 5. 两个虚拟按键能切换菜单、倍率、增强等级和截图。
 6. 截图保存的是最终瞄具屏幕画面。
 7. 切换到 `Visible Demo` 时，HUD/状态栏明确显示可见光演示模式。
+8. `Tiny x2 Detail + Fine + Low Smooth` 下 Outline 边缘应比 Native 更细、更硬，灰色糊边更少。

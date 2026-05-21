@@ -13,7 +13,7 @@ from __future__ import annotations
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import cv2
@@ -106,19 +106,28 @@ class CaptureThread(QThread):
             first_frame, first_frame_ms = _await_first_frame(cap, timeout_s=1.8, delay_s=0.06)
             if first_frame is None:
                 cap.release()
+                if (cfg.width, cfg.height) != (256, 192):
+                    self.status.emit(
+                        f"UVC {cfg.width}x{cfg.height} timed out; falling back to 256x192"
+                    )
+                    self._run_uvc(replace(cfg, width=256, height=192))
+                    return
                 self.error.emit(pack_capture_error(
                     ERR_FIRST_FRAME_TIMEOUT,
                     f"摄像头 index={cfg.camera_index} 首帧超时，请稍后重试",
                 ))
                 return
 
+        actual_w, actual_h = _capture_dimensions(cap, first_frame)
         if y16_mode:
             self.status.emit(
-                f"UVC opened idx={cfg.camera_index} backend={backend_name} mode=Y16(raw) first={first_frame_ms:.0f}ms"
+                f"UVC opened idx={cfg.camera_index} backend={backend_name} mode=Y16(raw) "
+                f"req={cfg.width}x{cfg.height} actual={actual_w}x{actual_h} first={first_frame_ms:.0f}ms"
             )
         else:
             self.status.emit(
-                f"UVC opened idx={cfg.camera_index} backend={backend_name} mode=8bit(fallback) first={first_frame_ms:.0f}ms"
+                f"UVC opened idx={cfg.camera_index} backend={backend_name} mode=8bit(fallback) "
+                f"req={cfg.width}x{cfg.height} actual={actual_w}x{actual_h} first={first_frame_ms:.0f}ms"
             )
 
         frame_id = 0
@@ -285,6 +294,18 @@ def _configure_capture_timing(cap: cv2.VideoCapture, cfg: CaptureConfig) -> None
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     except Exception:
         pass
+
+
+def _capture_dimensions(cap: cv2.VideoCapture, frame: np.ndarray) -> tuple[int, int]:
+    try:
+        actual_w = int(round(cap.get(cv2.CAP_PROP_FRAME_WIDTH)))
+        actual_h = int(round(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+    except Exception:
+        actual_w = actual_h = 0
+    if actual_w <= 0 or actual_h <= 0:
+        h, w = frame.shape[:2]
+        return int(w), int(h)
+    return actual_w, actual_h
 
 
 def pack_capture_error(code: str, message: str) -> str:

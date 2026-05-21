@@ -32,6 +32,9 @@ ALL_PROFILES = (PROFILE_THERMAL, PROFILE_VISIBLE)
 class OutlineConfig:
     level: int = 3
     profile: str = PROFILE_THERMAL
+    processing_scale: float = 1.0
+    detail_mode: str = "balanced"
+    smooth_mode: str = "low"
     gaussian_ksize: int = 5
     sobel_weight: float = 0.58
     scharr_weight: float = 0.42
@@ -39,8 +42,10 @@ class OutlineConfig:
     low_ratio: float = 0.44
     bridge_strength_ratio: float = 0.55
     bridge_max_gap: int = 2
-    glow_gain: float = 0.22
+    glow_gain: float = 0.04
     glow_sigma: float = 0.9
+    edge_hardness: float = 0.88
+    glow_mode: str = "low"
     temporal_alpha: float = 0.58
     thermal_gate_percentile: float = 74.0
     thermal_gate_dilate: int = 7
@@ -48,6 +53,8 @@ class OutlineConfig:
     visible_edge_density: float = 0.024
     visible_min_component_area: int = 8
     visible_bilateral_d: int = 5
+    thermal_max_processing_pixels: int = 360_000
+    visible_max_processing_pixels: int = 520_000
 
 
 class OutlineProcessor:
@@ -82,9 +89,14 @@ class OutlineProcessor:
         raw14 = thermal_processing.to_raw14(raw14)
         cleaned = _suppress_bad_pixels(raw14).astype(np.float32)
         smoothed = self._apply_temporal(cleaned, PROFILE_THERMAL, cfg.temporal_alpha, update_temporal)
+        smoothed, _scale = _scale_for_processing(
+            smoothed,
+            cfg.processing_scale,
+            max_pixels=cfg.thermal_max_processing_pixels,
+        )
 
-        k = max(3, int(cfg.gaussian_ksize) | 1)
-        denoised = cv2.GaussianBlur(smoothed, (k, k), 0)
+        k = max(1, int(cfg.gaussian_ksize) | 1)
+        denoised = cv2.GaussianBlur(smoothed, (k, k), 0) if k > 1 else smoothed
         gate = _thermal_target_gate(smoothed, cfg)
 
         nms, theta = _gradient_nms(denoised, cfg)
@@ -95,7 +107,7 @@ class OutlineProcessor:
         level = _level(cfg.level)
         high_pct = np.clip(cfg.high_percentile - (level - 3) * 1.4, 78.0, 98.5)
         low_ratio = np.clip(cfg.low_ratio - (level - 3) * 0.03, 0.28, 0.62)
-        glow_gain = np.clip(cfg.glow_gain + (level - 3) * 0.03, 0.08, 0.36)
+        glow_gain = _glow_gain_for_mode(cfg)
 
         edges, high_thr = _hysteresis_connect(nms, high_pct=high_pct, low_ratio=low_ratio)
         if high_thr > 0.0:
@@ -109,7 +121,14 @@ class OutlineProcessor:
             max_gap=cfg.bridge_max_gap,
         )
         edges = _cap_edge_density(edges, nms, _density_for_level(cfg.thermal_edge_density, level))
-        return _to_strength_outline(edges, nms, high_thr, glow_gain=glow_gain, glow_sigma=cfg.glow_sigma)
+        return _to_strength_outline(
+            edges,
+            nms,
+            high_thr,
+            glow_gain=glow_gain,
+            glow_sigma=cfg.glow_sigma,
+            edge_hardness=cfg.edge_hardness,
+        )
 
     def _render_visible(
         self,
@@ -120,10 +139,17 @@ class OutlineProcessor:
     ) -> np.ndarray:
         gray = _visible_gray(raw14, visible_frame)
         gray = _contrast_stretch_u8(gray, p_low=1.0, p_high=99.0)
+        gray, _scale = _scale_for_processing(
+            gray,
+            cfg.processing_scale,
+            max_pixels=cfg.visible_max_processing_pixels,
+        )
 
         d = max(3, int(cfg.visible_bilateral_d) | 1)
-        denoised = cv2.bilateralFilter(gray, d=d, sigmaColor=34, sigmaSpace=5)
-        denoised = cv2.GaussianBlur(denoised, (3, 3), 0)
+        denoised = cv2.bilateralFilter(gray, d=d, sigmaColor=34, sigmaSpace=5) if d > 1 else gray
+        k = max(1, int(cfg.gaussian_ksize) | 1)
+        if k > 1:
+            denoised = cv2.GaussianBlur(denoised, (min(k, 5), min(k, 5)), 0)
         smoothed = self._apply_temporal(
             denoised.astype(np.float32),
             PROFILE_VISIBLE,
@@ -151,8 +177,15 @@ class OutlineProcessor:
             max_gap=max(1, cfg.bridge_max_gap),
         )
         edges = _cap_edge_density(edges, nms, _density_for_level(cfg.visible_edge_density, level))
-        glow_gain = np.clip(0.16 + (level - 3) * 0.025, 0.08, 0.26)
-        return _to_strength_outline(edges, nms, high_thr, glow_gain=glow_gain, glow_sigma=0.75)
+        glow_gain = _glow_gain_for_mode(cfg) * 0.8
+        return _to_strength_outline(
+            edges,
+            nms,
+            high_thr,
+            glow_gain=glow_gain,
+            glow_sigma=0.65,
+            edge_hardness=cfg.edge_hardness,
+        )
 
     def _apply_temporal(
         self,
@@ -202,6 +235,36 @@ def _density_for_level(base: float, level: int) -> float:
     # ENH 1 should be sparse and stable; ENH 5 intentionally exposes more weak
     # texture for tuning and demos.
     return float(np.clip(base * (0.66 + 0.18 * (level - 1)), 0.004, 0.085))
+
+
+def _scale_for_processing(
+    img: np.ndarray,
+    requested_scale: float,
+    max_pixels: int,
+) -> tuple[np.ndarray, float]:
+    scale = float(np.clip(requested_scale, 1.0, 3.0))
+    if scale <= 1.01 or img.size == 0:
+        return img, 1.0
+    h, w = img.shape[:2]
+    max_scale = (float(max_pixels) / float(max(h * w, 1))) ** 0.5
+    scale = min(scale, max(1.0, max_scale))
+    if scale <= 1.01:
+        return img, 1.0
+    target = (max(2, int(round(w * scale))), max(2, int(round(h * scale))))
+    interp = cv2.INTER_CUBIC if img.dtype != np.uint8 else cv2.INTER_LINEAR
+    return cv2.resize(img, target, interpolation=interp), scale
+
+
+def _glow_gain_for_mode(cfg: OutlineConfig) -> float:
+    if cfg.glow_mode not in ("off", "low", "mid", "high"):
+        return float(np.clip(cfg.glow_gain, 0.0, 0.24))
+    mode_gain = {
+        "off": 0.0,
+        "low": 0.035,
+        "mid": 0.07,
+        "high": 0.13,
+    }[cfg.glow_mode]
+    return float(np.clip(mode_gain, 0.0, 0.24))
 
 
 def _visible_gray(raw14: np.ndarray, visible_frame: Optional[np.ndarray]) -> np.ndarray:
@@ -442,6 +505,7 @@ def _to_strength_outline(
     high_thr: float,
     glow_gain: float,
     glow_sigma: float,
+    edge_hardness: float,
 ) -> np.ndarray:
     edges_bool = edges > 0
     if not edges_bool.any():
@@ -450,7 +514,10 @@ def _to_strength_outline(
         vals = strength[edges_bool]
         high_thr = float(np.percentile(vals, 75.0)) + 1e-6
     rel = np.clip(strength / float(high_thr), 0.0, 1.65)
-    brightness = 68.0 + 187.0 * np.clip((rel - 0.34) / 1.12, 0.0, 1.0)
+    graded = 58.0 + 197.0 * np.clip((rel - 0.34) / 1.12, 0.0, 1.0)
+    hard = np.where(rel >= 0.72, 255.0, 218.0)
+    hardness = float(np.clip(edge_hardness, 0.0, 1.0))
+    brightness = (1.0 - hardness) * graded + hardness * hard
     core = np.where(edges_bool, brightness, 0.0).astype(np.float32)
     if glow_gain > 0.0:
         blur = cv2.GaussianBlur(core, (0, 0), sigmaX=max(float(glow_sigma), 0.1))

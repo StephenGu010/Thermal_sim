@@ -27,6 +27,10 @@ class ScopeRenderState:
     frame_id: int = 0
     fps: float = 0.0
     processing_profile: str = "thermal"
+    resolution_label: str = "256x192"
+    outline_processing_scale: float = 1.0
+    outline_scale_x: float = 1.0
+    outline_scale_y: float = 1.0
 
 
 SCREEN_W = 960
@@ -84,7 +88,8 @@ def render_scope_frame(
     """Return a 960x540 BGR image that looks like the scope display itself."""
     base_gray = outline_gray if state.outline_enabled else enhanced_gray
     view_gray, crop = _crop_zoom_16x9(base_gray, state.zoom)
-    view_gray = cv2.resize(view_gray, (SCREEN_W, SCREEN_H), interpolation=cv2.INTER_LINEAR)
+    interp = cv2.INTER_NEAREST if state.outline_enabled else cv2.INTER_LINEAR
+    view_gray = cv2.resize(view_gray, (SCREEN_W, SCREEN_H), interpolation=interp)
     if not state.outline_enabled and state.palette == PALETTE_BLACKHOT:
         view_gray = 255 - view_gray
     bgr = _outline_to_bgr(view_gray) if state.outline_enabled else _whitehot_to_bgr(view_gray, state.palette)
@@ -93,7 +98,15 @@ def render_scope_frame(
     if not state.outline_enabled:
         _draw_target_outlines(bgr, classifications, crop, sx, sy)
     if hotspot is not None:
-        _draw_hotspot(bgr, hotspot, crop, sx, sy)
+        draw_hotspot = hotspot
+        if state.outline_enabled:
+            hx, hy, hv = hotspot
+            draw_hotspot = (
+                int(round(hx * max(state.outline_scale_x, 0.001))),
+                int(round(hy * max(state.outline_scale_y, 0.001))),
+                hv,
+            )
+        _draw_hotspot(bgr, draw_hotspot, crop, sx, sy)
     _draw_reticle(bgr)
     _draw_hud(bgr, state)
     if state.menu_open:
@@ -227,7 +240,9 @@ def _draw_hud(img: np.ndarray, state: ScopeRenderState) -> None:
         mode = "OUT" if state.outline_enabled else ("BHOT" if state.palette == PALETTE_BLACKHOT else "WHOT")
     freeze = " HOLD" if state.frozen else ""
     cv2.putText(img, f"{mode}{freeze}", (SCREEN_W - 132, SCREEN_H - 24), font, 0.48, HUD_DIM, 1, cv2.LINE_AA)
-    profile = "VISIBLE DEMO" if visible else "THERMAL RAW"
+    scale = f" x{state.outline_processing_scale:.1f}".replace(".0", "") \
+        if state.outline_processing_scale > 1.01 else ""
+    profile = ("VISIBLE DEMO" if visible else "THERMAL RAW") + f" {state.resolution_label}{scale}"
     cv2.putText(img, profile, (28, SCREEN_H - 24), font, 0.46, HUD_DIM, 1, cv2.LINE_AA)
 
 

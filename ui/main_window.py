@@ -65,10 +65,103 @@ PROFILE_NAMES = {
     outline_processing.PROFILE_THERMAL: "Thermal Tiny1-C",
     outline_processing.PROFILE_VISIBLE: "Visible Demo",
 }
+RESOLUTION_PRESETS = {
+    "native": {
+        "label": "Native 256x192",
+        "capture": (256, 192),
+        "processing_scale": 1.0,
+        "hud": "256x192",
+    },
+    "hd": {
+        "label": "HD 640x480",
+        "capture": (640, 480),
+        "processing_scale": 1.0,
+        "hud": "640x480",
+    },
+    "p720": {
+        "label": "720p 1280x720",
+        "capture": (1280, 720),
+        "processing_scale": 1.0,
+        "hud": "1280x720",
+    },
+    "tiny_x2": {
+        "label": "Tiny x2 Detail",
+        "capture": (256, 192),
+        "processing_scale": 2.0,
+        "hud": "256x192",
+    },
+}
+DETAIL_PRESETS = {
+    "clean": {
+        "label": "Clean",
+        "processing_scale": 1.0,
+        "high_delta": 2.5,
+        "density": 0.72,
+        "bridge": 1,
+        "hardness": 0.96,
+    },
+    "balanced": {
+        "label": "Balanced",
+        "processing_scale": 1.25,
+        "high_delta": 0.0,
+        "density": 1.0,
+        "bridge": 2,
+        "hardness": 0.91,
+    },
+    "fine": {
+        "label": "Fine",
+        "processing_scale": 1.5,
+        "high_delta": -1.8,
+        "density": 1.18,
+        "bridge": 2,
+        "hardness": 0.88,
+    },
+    "ultra": {
+        "label": "Ultra",
+        "processing_scale": 2.0,
+        "high_delta": -3.0,
+        "density": 1.35,
+        "bridge": 3,
+        "hardness": 0.84,
+    },
+}
+SMOOTH_PRESETS = {
+    "off": {
+        "label": "Off",
+        "gaussian": 1,
+        "bilateral": 1,
+        "temporal": 0.95,
+        "glow": "off",
+    },
+    "low": {
+        "label": "Low",
+        "gaussian": 3,
+        "bilateral": 3,
+        "temporal": 0.74,
+        "glow": "low",
+    },
+    "mid": {
+        "label": "Mid",
+        "gaussian": 3,
+        "bilateral": 5,
+        "temporal": 0.58,
+        "glow": "low",
+    },
+    "high": {
+        "label": "High",
+        "gaussian": 5,
+        "bilateral": 7,
+        "temporal": 0.44,
+        "glow": "mid",
+    },
+}
 PROBE_MAX_INDEX = 12
-SOURCE_COMBO_WIDTH = 240
-SCENE_COMBO_WIDTH = 170
-PROFILE_COMBO_WIDTH = 180
+SOURCE_COMBO_WIDTH = 210
+SCENE_COMBO_WIDTH = 150
+PROFILE_COMBO_WIDTH = 165
+RESOLUTION_COMBO_WIDTH = 160
+DETAIL_COMBO_WIDTH = 105
+SMOOTH_COMBO_WIDTH = 90
 LAST_SOURCE_FILE = PROJECT_ROOT / "output" / "last_source.json"
 
 
@@ -174,6 +267,24 @@ class MainWindow(QMainWindow):
             self.cmb_profile.addItem(label, profile)
         self.cmb_profile.setCurrentIndex(0)
         self.cmb_profile.currentIndexChanged.connect(self._on_profile_changed)
+        self.cmb_resolution = QComboBox()
+        self.cmb_resolution.setFixedWidth(RESOLUTION_COMBO_WIDTH)
+        for key, preset in RESOLUTION_PRESETS.items():
+            self.cmb_resolution.addItem(preset["label"], key)
+        self.cmb_resolution.setCurrentIndex(3)
+        self.cmb_resolution.currentIndexChanged.connect(self._on_resolution_changed)
+        self.cmb_detail = QComboBox()
+        self.cmb_detail.setFixedWidth(DETAIL_COMBO_WIDTH)
+        for key, preset in DETAIL_PRESETS.items():
+            self.cmb_detail.addItem(preset["label"], key)
+        self.cmb_detail.setCurrentIndex(2)
+        self.cmb_detail.currentIndexChanged.connect(self._on_tuning_changed)
+        self.cmb_smooth = QComboBox()
+        self.cmb_smooth.setFixedWidth(SMOOTH_COMBO_WIDTH)
+        for key, preset in SMOOTH_PRESETS.items():
+            self.cmb_smooth.addItem(preset["label"], key)
+        self.cmb_smooth.setCurrentIndex(1)
+        self.cmb_smooth.currentIndexChanged.connect(self._on_tuning_changed)
 
         self.btn_refresh = QToolButton()
         self.btn_refresh.setText("Refresh")
@@ -194,6 +305,9 @@ class MainWindow(QMainWindow):
             ("Source", self.cmb_source),
             ("Scene", self.cmb_scene),
             ("Profile", self.cmb_profile),
+            ("Resolution", self.cmb_resolution),
+            ("Detail", self.cmb_detail),
+            ("Smooth", self.cmb_smooth),
         ):
             lab = QLabel(label)
             lab.setStyleSheet("color:#9aa;")
@@ -271,11 +385,12 @@ class MainWindow(QMainWindow):
             self._notify("Please select a valid source")
             return
         scene = self.cmb_scene.currentData()
+        width, height = self._current_capture_size()
         if source == SOURCE_MOCK:
-            cfg = CaptureConfig(source_kind=SOURCE_MOCK, width=256, height=192, scene=scene)
+            cfg = CaptureConfig(source_kind=SOURCE_MOCK, width=width, height=height, scene=scene)
         elif self._is_uvc_item(source):
             _kind, idx = source
-            cfg = CaptureConfig(source_kind=SOURCE_UVC, camera_index=int(idx), width=256, height=192, scene=scene)
+            cfg = CaptureConfig(source_kind=SOURCE_UVC, camera_index=int(idx), width=width, height=height, scene=scene)
         else:
             self._notify("Unsupported source entry")
             return
@@ -291,13 +406,18 @@ class MainWindow(QMainWindow):
         self._saved_source_this_run = False
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self._notify(f"Capture started: {self.cmb_source.currentText()} / {self._profile_text()}")
+        self._notify(
+            f"Capture started: {self.cmb_source.currentText()} / {self._profile_text()} / "
+            f"{self._resolution_text()}"
+        )
 
     def _stop_capture(self) -> None:
         if self._capture is None:
             return
         self._capture.requestInterruption()
         self._capture.wait(2000)
+        if self._capture is not None and not self._capture.isRunning():
+            self._on_capture_finished()
 
     def _on_capture_finished(self) -> None:
         self._capture = None
@@ -390,6 +510,22 @@ class MainWindow(QMainWindow):
             self._notify("Profile: Thermal Tiny1-C (raw/Y16 preferred)")
         self._rerender_last(force_reenhance=True)
 
+    def _on_resolution_changed(self) -> None:
+        self._outline_processor.reset()
+        if self._capture is not None:
+            self._notify(f"Resolution changed to {self._resolution_text()}, restarting capture")
+            self._stop_capture()
+            self._start_capture()
+            return
+        self._rerender_last(force_reenhance=True)
+
+    def _on_tuning_changed(self) -> None:
+        self._outline_processor.reset()
+        self._notify(
+            f"Outline tuning: {self._resolution_text()} / {self._detail_text()} / {self._smooth_text()}"
+        )
+        self._rerender_last(force_reenhance=True)
+
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.isAutoRepeat():
             return
@@ -439,16 +575,17 @@ class MainWindow(QMainWindow):
         self._state.processing_profile = profile
         enhance_cfg = scope_enhancement.ScopeEnhanceConfig(level=self._state.enhancement_level)
         enhanced = scope_enhancement.enhance_scope_whitehot(raw14_u16, enhance_cfg)
-        outline_cfg = outline_processing.OutlineConfig(
-            level=self._state.enhancement_level,
-            profile=profile,
-        )
+        outline_cfg = self._build_outline_config(profile)
         outline = self._outline_processor.render(
             raw14_u16,
             outline_cfg,
             visible_frame=visible_frame,
             update_temporal=update_temporal,
         )
+        self._state.outline_scale_x = outline.shape[1] / max(enhanced.shape[1], 1)
+        self._state.outline_scale_y = outline.shape[0] / max(enhanced.shape[0], 1)
+        self._state.outline_processing_scale = max(self._state.outline_scale_x, self._state.outline_scale_y)
+        self._state.resolution_label = self._resolution_hud_text()
 
         if profile == outline_processing.PROFILE_VISIBLE:
             mask = np.zeros_like(enhanced, dtype=np.uint8)
@@ -479,6 +616,7 @@ class MainWindow(QMainWindow):
 
     def _update_state_label(self) -> None:
         self._state.processing_profile = self._current_profile()
+        self._state.resolution_label = self._resolution_hud_text()
         profile = "VISIBLE DEMO" if self._state.processing_profile == outline_processing.PROFILE_VISIBLE else "THERMAL"
         mode = "OUTLINE" if self._state.outline_enabled else (
             "BHOT" if self._state.palette == scope_renderer.PALETTE_BLACKHOT else "WHOT"
@@ -487,7 +625,9 @@ class MainWindow(QMainWindow):
         hold = " HOLD" if self._state.frozen else ""
         outline = "" if self._state.outline_enabled else " NO-OUT"
         self.lbl_state.setText(
-            f"{profile}  {mode}  ENH {self._state.enhancement_level}  ZOOM {self._state.zoom}x{outline}{hold}{menu}"
+            f"{profile}  {mode}  {self._resolution_hud_text()}  "
+            f"{self._detail_text()}  {self._smooth_text()}  ENH {self._state.enhancement_level}  "
+            f"ZOOM {self._state.zoom}x{outline}{hold}{menu}"
         )
 
     # ------------------------------------------------------------------
@@ -534,6 +674,80 @@ class MainWindow(QMainWindow):
 
     def _profile_text(self) -> str:
         return PROFILE_NAMES.get(self._current_profile(), "Thermal Tiny1-C")
+
+    def _current_resolution_key(self) -> str:
+        if not hasattr(self, "cmb_resolution"):
+            return "tiny_x2"
+        key = self.cmb_resolution.currentData()
+        return key if key in RESOLUTION_PRESETS else "tiny_x2"
+
+    def _current_detail_key(self) -> str:
+        if not hasattr(self, "cmb_detail"):
+            return "fine"
+        key = self.cmb_detail.currentData()
+        return key if key in DETAIL_PRESETS else "fine"
+
+    def _current_smooth_key(self) -> str:
+        if not hasattr(self, "cmb_smooth"):
+            return "low"
+        key = self.cmb_smooth.currentData()
+        return key if key in SMOOTH_PRESETS else "low"
+
+    def _current_capture_size(self) -> tuple[int, int]:
+        preset = RESOLUTION_PRESETS[self._current_resolution_key()]
+        width, height = preset["capture"]
+        return int(width), int(height)
+
+    def _current_processing_scale(self) -> float:
+        res = RESOLUTION_PRESETS[self._current_resolution_key()]
+        detail = DETAIL_PRESETS[self._current_detail_key()]
+        return float(max(res["processing_scale"], detail["processing_scale"]))
+
+    def _resolution_text(self) -> str:
+        return RESOLUTION_PRESETS[self._current_resolution_key()]["label"]
+
+    def _resolution_hud_text(self) -> str:
+        return RESOLUTION_PRESETS[self._current_resolution_key()]["hud"]
+
+    def _detail_text(self) -> str:
+        return DETAIL_PRESETS[self._current_detail_key()]["label"]
+
+    def _smooth_text(self) -> str:
+        return SMOOTH_PRESETS[self._current_smooth_key()]["label"]
+
+    def _build_outline_config(self, profile: str) -> outline_processing.OutlineConfig:
+        detail_key = self._current_detail_key()
+        smooth_key = self._current_smooth_key()
+        detail = DETAIL_PRESETS[detail_key]
+        smooth = SMOOTH_PRESETS[smooth_key]
+
+        thermal_density = 0.036 * detail["density"]
+        visible_density = 0.020 * detail["density"]
+        high_percentile = 93.0 + detail["high_delta"]
+        if profile == outline_processing.PROFILE_VISIBLE:
+            high_percentile += 1.2
+
+        return outline_processing.OutlineConfig(
+            level=self._state.enhancement_level,
+            profile=profile,
+            processing_scale=self._current_processing_scale(),
+            detail_mode=detail_key,
+            smooth_mode=smooth_key,
+            gaussian_ksize=int(smooth["gaussian"]),
+            high_percentile=float(high_percentile),
+            low_ratio=0.48 if detail_key == "clean" else 0.42,
+            bridge_strength_ratio=0.68 if detail_key == "clean" else 0.54,
+            bridge_max_gap=int(detail["bridge"]),
+            glow_gain=0.04,
+            glow_sigma=0.55,
+            edge_hardness=float(detail["hardness"]),
+            glow_mode=str(smooth["glow"]),
+            temporal_alpha=float(smooth["temporal"]),
+            thermal_edge_density=float(thermal_density),
+            visible_edge_density=float(visible_density),
+            visible_min_component_area=12 if detail_key in ("clean", "balanced") else 7,
+            visible_bilateral_d=int(smooth["bilateral"]),
+        )
 
     def _load_last_uvc_index(self) -> Optional[int]:
         try:

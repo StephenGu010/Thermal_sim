@@ -52,6 +52,7 @@
 raw14
 → bad-pixel suppression
 → temporal EMA
+→ optional internal upsample (`Tiny x2 Detail` / Detail mode)
 → Gaussian denoise (轻量低通)
 → thermal target gate
 → Sobel(5x5) + Scharr 混合梯度
@@ -60,7 +61,7 @@ raw14
 → 双阈值滞后连通
 → edge density cap
 → 基于方向的 1-2 像素补边
-→ 输出强弱分层的纯边缘图（低频=0，高频按强度映射）
+→ hard-edge 映射输出纯边缘图（低频=0，高频接近二值亮边）
 ```
 
 ### 4.3 Visible Demo 管线
@@ -69,6 +70,7 @@ raw14
 
 ```text
 visible BGR/gray
+→ optional high-resolution capture / internal upsample
 → bilateral/Gaussian denoise
 → mild contrast stretch
 → Sobel/Scharr + Canny-like linking
@@ -95,13 +97,23 @@ visible BGR/gray
 - `sobel_weight=0.58`, `scharr_weight=0.42`
 - `high_percentile=92.0`, `low_ratio=0.44`
 - `bridge_max_gap=2`, `bridge_strength_ratio=0.55`
-- `glow_gain=0.22`, `glow_sigma=0.9`
+- `glow_gain≈0.04`, `glow_sigma≈0.55`
 - `temporal_alpha=0.58`
 - `thermal_gate_percentile=74.0`
 - `thermal_edge_density=0.045`
 - `visible_edge_density=0.024`
+- `processing_scale=1.0..2.0`
+- `edge_hardness=0.84..0.96`
+- `glow_mode=off/low/mid/high`
 
 增强等级 `ENH 1..5` 会联动阈值、glow 强度和边缘密度，达到“弱边缘可见性”和“噪声抑制”平衡。
+
+调参控件说明：
+
+- `Resolution` 控制 UVC 请求分辨率和 Tiny x2 内部处理倍率。
+- `Detail` 控制边缘密度、阈值、补线强度和硬边程度。
+- `Smooth` 控制时域/空间平滑；过高会稳定但可能糊边。
+- `Tiny x2 Detail` 是算法上采样增强，不代表 Tiny1-C 传感器物理分辨率提升。
 
 ## 6. 已知偏差与后续建议
 
@@ -112,4 +124,3 @@ visible BGR/gray
   2. 边缘连续度（断裂长度分布）
   3. 背景残留亮度（应接近 0）
   4. 目标边缘主观对齐（人体轮廓、热物体轮廓）
-
