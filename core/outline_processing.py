@@ -168,14 +168,18 @@ class OutlineProcessor:
             edges = ((edges > 0) & ((canny > 0) | (nms >= high_thr * 1.15))).astype(np.uint8)
 
         edges = _clean_small_components(edges, min_area=max(1, int(cfg.visible_min_component_area)))
-        edges = _bridge_small_gaps(
-            edges,
-            theta,
-            nms,
-            high_thr,
-            strength_ratio=0.70,
-            max_gap=max(1, cfg.bridge_max_gap),
-        )
+        if edges.size <= 260_000:
+            edges = _bridge_small_gaps(
+                edges,
+                theta,
+                nms,
+                high_thr,
+                strength_ratio=0.70,
+                max_gap=max(1, cfg.bridge_max_gap),
+            )
+        elif cfg.bridge_max_gap > 1:
+            kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+            edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
         edges = _cap_edge_density(edges, nms, _density_for_level(cfg.visible_edge_density, level))
         glow_gain = _glow_gain_for_mode(cfg) * 0.8
         return _to_strength_outline(
@@ -242,16 +246,20 @@ def _scale_for_processing(
     requested_scale: float,
     max_pixels: int,
 ) -> tuple[np.ndarray, float]:
-    scale = float(np.clip(requested_scale, 1.0, 3.0))
-    if scale <= 1.01 or img.size == 0:
+    requested = float(np.clip(requested_scale, 0.25, 3.0))
+    if img.size == 0:
         return img, 1.0
     h, w = img.shape[:2]
     max_scale = (float(max_pixels) / float(max(h * w, 1))) ** 0.5
-    scale = min(scale, max(1.0, max_scale))
-    if scale <= 1.01:
+    scale = min(requested, max_scale) if max_scale < requested else requested
+    scale = max(0.25, scale)
+    if abs(scale - 1.0) <= 0.02:
         return img, 1.0
     target = (max(2, int(round(w * scale))), max(2, int(round(h * scale))))
-    interp = cv2.INTER_CUBIC if img.dtype != np.uint8 else cv2.INTER_LINEAR
+    if scale < 1.0:
+        interp = cv2.INTER_AREA
+    else:
+        interp = cv2.INTER_CUBIC if img.dtype != np.uint8 else cv2.INTER_LINEAR
     return cv2.resize(img, target, interpolation=interp), scale
 
 
@@ -478,11 +486,9 @@ def _clean_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
     num, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), connectivity=8)
     if num <= 1:
         return (mask > 0).astype(np.uint8)
-    out = np.zeros(mask.shape, dtype=np.uint8)
-    for i in range(1, num):
-        if int(stats[i, cv2.CC_STAT_AREA]) >= min_area:
-            out[labels == i] = 1
-    return out
+    keep = stats[:, cv2.CC_STAT_AREA] >= int(min_area)
+    keep[0] = False
+    return keep[labels].astype(np.uint8)
 
 
 def _cap_edge_density(edges: np.ndarray, strength: np.ndarray, max_density: float) -> np.ndarray:

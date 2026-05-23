@@ -62,6 +62,11 @@ python main.py
 - `Start/Stop`：开始或停止采集。
 - `Screenshot`：保存当前瞄具屏幕画面。
 
+状态栏末尾的 `Pxxms` 表示最近一帧从输入处理到 HUD 合成的耗时。`P20ms`
+左右通常比较流畅；如果 Windows 端看到 `P50ms` 以上，优先把
+`Resolution` 降到 `HD 640x480` 或 `Native 256x192`，把 `Detail` 降到
+`Balanced/Clean`，并避免 `High Smooth`。
+
 虚拟物理按键：
 
 - 左键 `MENU / NEXT` 短按：打开菜单或切换菜单项。
@@ -130,6 +135,8 @@ USB/Mock raw14
 - `OUTLINE=ON` 时底图改为纯边缘图，不叠加人物/物体分类描边。
 - `Visible Demo` 下不运行热目标分类和热点标记，HUD 会显示 `VISIBLE DEMO`。
 - `Tiny x2 Detail` 是算法内部上采样增强，不代表 Tiny1-C 传感器物理分辨率提升。
+- 高分辨率可见光 Outline 会明显增加 CPU 压力；程序会对过大的输入做内部降采样，
+  并在主线程处理过慢时丢弃部分中间帧，保证 UI 不持续堆积卡死。
 - 低频分量在 outline 输出中直接置零，仅保留高频边缘。
 - 文档 `docs/holosun_outline_reverse_engineering.md` 记录了参数、依据和偏差说明。
 
@@ -174,3 +181,4 @@ python -m compileall -q main.py core ui
 6. 截图保存的是最终瞄具屏幕画面。
 7. 切换到 `Visible Demo` 时，HUD/状态栏明确显示可见光演示模式。
 8. `Tiny x2 Detail + Fine + Low Smooth` 下 Outline 边缘应比 Native 更细、更硬，灰色糊边更少。
+9. 状态栏 `Pxxms` 可用于判断卡顿来源；数值高说明处理链路重，不是单纯窗口绘制慢。

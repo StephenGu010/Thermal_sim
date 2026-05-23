@@ -190,6 +190,8 @@ class MainWindow(QMainWindow):
         self._active_source_data = None
         self._saved_source_this_run = False
         self._source_probe_cache = []
+        self._last_process_ts = 0.0
+        self._last_process_ms = 0.0
 
         self._build_ui()
         self.setStatusBar(QStatusBar())
@@ -551,11 +553,18 @@ class MainWindow(QMainWindow):
             self.video.set_frame(self._last_scope)
             return
 
+        now = time.perf_counter()
+        target_fps = 20.0 if self._state.outline_enabled else 30.0
+        if self._last_scope is not None and now - self._last_process_ts < 1.0 / target_fps:
+            return
+        self._last_process_ts = now
+
         if not self._saved_source_this_run and self._is_uvc_item(self._active_source_data):
             _kind, idx = self._active_source_data
             self._save_last_uvc_index(int(idx))
             self._saved_source_this_run = True
 
+        t0 = time.perf_counter()
         raw14_u16 = thermal_processing.to_raw14(raw14)
         self._last_raw = raw14_u16.copy()
         self._last_visible_frame = bgr_or_none.copy() if isinstance(bgr_or_none, np.ndarray) else None
@@ -564,6 +573,7 @@ class MainWindow(QMainWindow):
         self._state.frame_id = frame_id
         self._state.fps = fps
         self._rerender_last()
+        self._last_process_ms = (time.perf_counter() - t0) * 1000.0
 
     def _process_raw_to_components(
         self,
@@ -573,8 +583,11 @@ class MainWindow(QMainWindow):
     ) -> None:
         profile = self._current_profile()
         self._state.processing_profile = profile
-        enhance_cfg = scope_enhancement.ScopeEnhanceConfig(level=self._state.enhancement_level)
-        enhanced = scope_enhancement.enhance_scope_whitehot(raw14_u16, enhance_cfg)
+        if profile == outline_processing.PROFILE_VISIBLE and self._state.outline_enabled:
+            enhanced = np.zeros(raw14_u16.shape[:2], dtype=np.uint8)
+        else:
+            enhance_cfg = scope_enhancement.ScopeEnhanceConfig(level=self._state.enhancement_level)
+            enhanced = scope_enhancement.enhance_scope_whitehot(raw14_u16, enhance_cfg)
         outline_cfg = self._build_outline_config(profile)
         outline = self._outline_processor.render(
             raw14_u16,
@@ -624,10 +637,11 @@ class MainWindow(QMainWindow):
         menu = f" MENU {self._state.menu_index + 1}" if self._state.menu_open else ""
         hold = " HOLD" if self._state.frozen else ""
         outline = "" if self._state.outline_enabled else " NO-OUT"
+        perf = f"  P{self._last_process_ms:.0f}ms" if self._last_process_ms > 0 else ""
         self.lbl_state.setText(
             f"{profile}  {mode}  {self._resolution_hud_text()}  "
             f"{self._detail_text()}  {self._smooth_text()}  ENH {self._state.enhancement_level}  "
-            f"ZOOM {self._state.zoom}x{outline}{hold}{menu}"
+            f"ZOOM {self._state.zoom}x{outline}{hold}{menu}{perf}"
         )
 
     # ------------------------------------------------------------------
